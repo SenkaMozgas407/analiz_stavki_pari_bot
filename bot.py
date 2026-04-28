@@ -17,6 +17,12 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SAMPLE_DATA_PATH = Path(os.getenv("SAMPLE_DATA_PATH", "data/sample_matches.json"))
 PARI_LINE_URL = os.getenv("PARI_LINE_URL")
+PARI_API_TIMEOUT = int(os.getenv("PARI_API_TIMEOUT", "20"))
+PARI_USER_AGENT = os.getenv(
+    "PARI_USER_AGENT",
+    "Mozilla/5.0 (compatible; PariLineBot/1.0; +https://t.me/)",
+)
+PARI_ACCEPT_LANGUAGE = os.getenv("PARI_ACCEPT_LANGUAGE", "ru-RU,ru;q=0.9,en;q=0.8")
 MIN_ODDS = 1.6
 
 if not TOKEN:
@@ -64,8 +70,96 @@ def value_count(value: Any) -> int:
     return 1
 
 
+def extract_esports_diagnostics(payload: Any) -> dict[str, Any]:
+    diagnostics = {
+        "total_events": 0,
+        "dota2_events": 0,
+        "cs2_events": 0,
+        "dota2_samples": [],
+        "cs2_samples": [],
+    }
+    if not isinstance(payload, dict):
+        return diagnostics
+
+    events = find_key(payload, "events")
+    if not isinstance(events, list):
+        return diagnostics
+
+    diagnostics["total_events"] = len(events)
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+
+        event_name = str(
+            event.get("name")
+            or event.get("eventName")
+            or event.get("title")
+            or event.get("matchName")
+            or "Unknown"
+        )
+        competition = str(
+            event.get("competitionName")
+            or event.get("leagueName")
+            or event.get("categoryName")
+            or ""
+        )
+        sport = str(
+            event.get("sportName")
+            or event.get("sport")
+            or event.get("gameName")
+            or ""
+        )
+        haystack = f"{event_name} {competition} {sport}".lower()
+
+        market_name = ""
+        odds_value = ""
+
+        markets = event.get("markets")
+        if isinstance(markets, list) and markets:
+            first_market = markets[0]
+            if isinstance(first_market, dict):
+                market_name = str(first_market.get("name") or first_market.get("marketName") or "")
+                outcomes = first_market.get("outcomes")
+                if isinstance(outcomes, list) and outcomes:
+                    first_outcome = outcomes[0]
+                    if isinstance(first_outcome, dict):
+                        odds_value = str(
+                            first_outcome.get("price")
+                            or first_outcome.get("value")
+                            or first_outcome.get("odds")
+                            or ""
+                        )
+
+        sample = {
+            "match": event_name,
+            "competition": competition,
+            "market": market_name,
+            "odds": odds_value,
+        }
+
+        if "dota" in haystack:
+            diagnostics["dota2_events"] += 1
+            if len(diagnostics["dota2_samples"]) < 3:
+                diagnostics["dota2_samples"].append(sample)
+
+        if any(token in haystack for token in ("cs2", "counter-strike 2", "counter strike 2", "counter-strike")):
+            diagnostics["cs2_events"] += 1
+            if len(diagnostics["cs2_samples"]) < 3:
+                diagnostics["cs2_samples"].append(sample)
+
+    return diagnostics
+
+
 def fetch_pari_line_debug(url: str) -> dict[str, Any]:
-    response = requests.get(url, timeout=20)
+    request_headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": PARI_ACCEPT_LANGUAGE,
+        "User-Agent": PARI_USER_AGENT,
+        "Referer": "https://pari.ru/",
+        "Origin": "https://pari.ru",
+    }
+    response = requests.get(url, timeout=PARI_API_TIMEOUT, headers=request_headers)
     body = response.text
     json_payload: Any | None = None
 
@@ -78,10 +172,13 @@ def fetch_pari_line_debug(url: str) -> dict[str, Any]:
     sports_value = find_key(json_payload, "sports") if is_json else None
     events_value = find_key(json_payload, "events") if is_json else None
     custom_factors_value = find_key(json_payload, "customFactors") if is_json else None
+    esports_info = extract_esports_diagnostics(json_payload) if is_json else extract_esports_diagnostics(None)
 
     return {
         "requested_url": response.url,
         "status_code": response.status_code,
+        "response_content_type": response.headers.get("Content-Type", "unknown"),
+        "request_headers_used": request_headers,
         "response_preview": truncate_text(body, 1000),
         "is_json": is_json,
         "has_sports": sports_value is not None,
@@ -90,6 +187,7 @@ def fetch_pari_line_debug(url: str) -> dict[str, Any]:
         "sports_count": value_count(sports_value),
         "events_count": value_count(events_value),
         "custom_factors_count": value_count(custom_factors_value),
+        "esports": esports_info,
     }
 
 
@@ -259,13 +357,20 @@ async def debug_pari(message: types.Message) -> None:
         "🔎 Диагностика PARI\n"
         f"URL: {debug_data['requested_url']}\n"
         f"Status code: {debug_data['status_code']}\n"
+        f"Content-Type: {debug_data['response_content_type']}\n"
         f"JSON найден: {'да' if debug_data['is_json'] else 'нет'}\n"
         f"Ключ sports: {'да' if debug_data['has_sports'] else 'нет'}\n"
         f"Ключ events: {'да' if debug_data['has_events'] else 'нет'}\n"
         f"Ключ customFactors: {'да' if debug_data['has_custom_factors'] else 'нет'}\n"
         f"Количество sports: {debug_data['sports_count']}\n"
         f"Количество events: {debug_data['events_count']}\n"
-        f"Количество customFactors: {debug_data['custom_factors_count']}\n\n"
+        f"Количество customFactors: {debug_data['custom_factors_count']}\n"
+        f"Киберспорт events всего: {debug_data['esports']['total_events']}\n"
+        f"Dota 2 events: {debug_data['esports']['dota2_events']}\n"
+        f"CS2 events: {debug_data['esports']['cs2_events']}\n"
+        f"Использованы заголовки: {json.dumps(debug_data['request_headers_used'], ensure_ascii=False)}\n"
+        f"Dota 2 samples: {json.dumps(debug_data['esports']['dota2_samples'], ensure_ascii=False)}\n"
+        f"CS2 samples: {json.dumps(debug_data['esports']['cs2_samples'], ensure_ascii=False)}\n\n"
         f"Первые 1000 символов ответа:\n{debug_data['response_preview']}"
     )
 

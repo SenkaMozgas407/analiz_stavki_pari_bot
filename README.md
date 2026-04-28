@@ -46,5 +46,7 @@ TELEGRAM_BOT_TOKEN=ваш_токен
 # опционально
 SAMPLE_DATA_PATH=data/sample_matches.json
 # для /debug_pari (обязательно для команды)
-PARI_LINE_URL=https://clientsapi.../line/list?lang=ru&version=...&scopeMarket=2300
+PARI_LINE_URL=https://clientsapi.pari.ru/line/list?lang=ru&scopeMarket=1600&version=0
 ```
+
+`bot.py` автоматически отправляет заголовки `Accept`, `Accept-Language`, `User-Agent`, `Referer`, `Origin` для endpoint `/line/list`, чтобы получать JSON-ответ для парсинга Telegram-ботом.
