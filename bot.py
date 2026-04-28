@@ -87,7 +87,7 @@ ESPORTS_KEYWORDS = (
     "e sports",
 )
 DOTA_KEYWORDS = ("dota", "дота")
-CS2_KEYWORDS = ("cs2", "counter-strike", "counter strike", "counterstrike", "cs:go", "кс")
+CS2_KEYWORDS = ("cs2", "counter-strike", "counter strike")
 
 
 def collect_collection(payload: Any, key: str) -> list[dict[str, Any]]:
@@ -202,12 +202,9 @@ def extract_esports_diagnostics(payload: Any) -> dict[str, Any]:
         tournament = tournament_by_id.get(str(event.get("tournamentId") or event.get("tournamentInfoId")))
         tournament_caption = first_non_empty(tournament or {}, ("caption", "name", "title"))
 
-        haystack = " ".join(
+        esports_haystack = " ".join(
             part
             for part in (
-                event_name,
-                team1,
-                team2,
                 event_caption,
                 sport_name,
                 sport_kind_name,
@@ -249,12 +246,12 @@ def extract_esports_diagnostics(payload: Any) -> dict[str, Any]:
             "odds": odds_value,
         }
 
-        if contains_any_keyword(haystack, DOTA_KEYWORDS):
+        if contains_any_keyword(esports_haystack, DOTA_KEYWORDS):
             diagnostics["dota2_events"] += 1
             if len(diagnostics["dota2_samples"]) < 3:
                 diagnostics["dota2_samples"].append(sample)
 
-        if contains_any_keyword(haystack, CS2_KEYWORDS):
+        if contains_any_keyword(esports_haystack, CS2_KEYWORDS):
             diagnostics["cs2_events"] += 1
             if len(diagnostics["cs2_samples"]) < 3:
                 diagnostics["cs2_samples"].append(sample)
@@ -350,6 +347,130 @@ def load_sample_matches() -> list[dict[str, Any]]:
     return validated
 
 
+def parse_odds_value(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        normalized = value.replace(",", ".").strip()
+        if not normalized:
+            return None
+        try:
+            return float(normalized)
+        except ValueError:
+            return None
+    return None
+
+
+def extract_real_matches(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+
+    sports = collect_collection(payload, "sports")
+    sport_kinds = collect_collection(payload, "sportKinds")
+    tournaments = collect_collection(payload, "tournamentInfos")
+    sport_categories = collect_collection(payload, "sportCategories")
+    events = collect_collection(payload, "events")
+
+    sport_by_id = dict_by_id(sports)
+    kind_by_id = dict_by_id(sport_kinds)
+    category_by_id = dict_by_id(sport_categories)
+    tournament_by_id = dict_by_id(tournaments)
+
+    predictions: list[dict[str, Any]] = []
+
+    for event in events:
+        event_name = first_non_empty(event, ("name", "eventName", "title", "matchName"))
+        team1 = first_non_empty(event, ("team1", "team1Name", "homeTeamName"))
+        team2 = first_non_empty(event, ("team2", "team2Name", "awayTeamName"))
+        event_caption = first_non_empty(event, ("caption",))
+
+        sport = sport_by_id.get(str(event.get("sportId")))
+        sport_name = first_non_empty(sport or {}, ("name", "caption", "title"))
+
+        sport_kind = kind_by_id.get(str(event.get("sportKindId")))
+        sport_kind_name = first_non_empty(sport_kind or {}, ("name", "caption", "title"))
+
+        category = category_by_id.get(str(event.get("sportCategoryId") or event.get("categoryId")))
+        category_caption = first_non_empty(category or {}, ("caption", "name", "title"))
+
+        tournament = tournament_by_id.get(str(event.get("tournamentId") or event.get("tournamentInfoId")))
+        tournament_caption = first_non_empty(tournament or {}, ("caption", "name", "title"))
+
+        esports_haystack = " ".join(
+            part
+            for part in (
+                event_caption,
+                sport_name,
+                sport_kind_name,
+                category_caption,
+                tournament_caption,
+            )
+            if part
+        )
+
+        is_dota = contains_any_keyword(esports_haystack, DOTA_KEYWORDS)
+        is_cs2 = contains_any_keyword(esports_haystack, CS2_KEYWORDS)
+        if not (is_dota or is_cs2):
+            continue
+
+        game = "Dota 2" if is_dota else "CS2"
+        match = event_name or " vs ".join(part for part in (team1, team2) if part) or "Unknown match"
+        markets = event.get("markets")
+        if not isinstance(markets, list):
+            continue
+
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            market_name = str(market.get("name") or market.get("marketName") or "").strip()
+            outcomes = market.get("outcomes")
+            if not isinstance(outcomes, list):
+                continue
+
+            for outcome in outcomes:
+                if not isinstance(outcome, dict):
+                    continue
+                odds = parse_odds_value(
+                    outcome.get("price")
+                    or outcome.get("value")
+                    or outcome.get("odds")
+                )
+                if odds is None or odds < MIN_ODDS:
+                    continue
+
+                selection = str(
+                    outcome.get("name")
+                    or outcome.get("caption")
+                    or outcome.get("title")
+                    or "Выбор не указан"
+                )
+                predictions.append(
+                    {
+                        "game": game,
+                        "match": match,
+                        "market": market_name or "Рынок не указан",
+                        "selection": selection,
+                        "odds": odds,
+                    }
+                )
+
+    return predictions
+
+
+def fetch_real_pari_matches(url: str) -> list[dict[str, Any]]:
+    request_headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": PARI_ACCEPT_LANGUAGE,
+        "User-Agent": PARI_USER_AGENT,
+        "Referer": "https://pari.ru/",
+        "Origin": "https://pari.ru",
+    }
+    response = requests.get(url, timeout=PARI_API_TIMEOUT, headers=request_headers)
+    response.raise_for_status()
+    payload = response.json()
+    return extract_real_matches(payload)
+
+
 def build_short_analytics(item: dict[str, Any]) -> str:
     market = item["market"].lower()
     if "побед" in market:
@@ -443,13 +564,29 @@ async def show_id(message: types.Message) -> None:
 
 @dp.message(Command("analyze"))
 async def analyze(message: types.Message) -> None:
-    await safe_send(message, "Запускаю анализ mock-данных...")
+    await safe_send(message, "Запускаю анализ PARI линии...")
 
-    try:
-        predictions = load_sample_matches()
-    except Exception as exc:
-        await safe_send(message, f"Ошибка чтения mock-данных: {exc}")
-        return
+    predictions: list[dict[str, Any]] = []
+    real_fetch_error: str | None = None
+
+    if PARI_LINE_URL:
+        try:
+            predictions = await asyncio.to_thread(fetch_real_pari_matches, PARI_LINE_URL)
+        except Exception as exc:
+            real_fetch_error = str(exc)
+
+    if predictions:
+        await safe_send(message, f"Найдены реальные варианты PARI: {len(predictions)}")
+    else:
+        await safe_send(message, "Реальных вариантов PARI нет, показываю резервные данные.")
+        if real_fetch_error:
+            await safe_send(message, f"Причина недоступности реальных данных: {real_fetch_error}")
+
+        try:
+            predictions = load_sample_matches()
+        except Exception as exc:
+            await safe_send(message, f"Ошибка чтения резервных данных: {exc}")
+            return
 
     if not predictions:
         await safe_send(message, f"Нет вариантов с коэффициентом >= {MIN_ODDS}.")
