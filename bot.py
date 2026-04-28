@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -99,7 +101,7 @@ async def start(message: types.Message) -> None:
         "Команды:\n"
         "/start — список команд\n"
         "/id — показать chat id\n"
-        "/analyze — анализ mock-данных"
+        "/analyze — анализ из sample_matches.json"
     )
 
 
@@ -110,13 +112,18 @@ async def show_id(message: types.Message) -> None:
 
 @dp.message(Command("analyze"))
 async def analyze(message: types.Message) -> None:
-    await message.answer("Запускаю анализ mock-данных...")
+    await message.answer("Начинаю анализ ставок...")
+    progress_task = asyncio.create_task(send_analyze_progress(message))
 
     try:
         predictions = load_sample_matches()
     except Exception as exc:
         await message.answer(f"Ошибка чтения mock-данных: {exc}")
         return
+    finally:
+        progress_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await progress_task
 
     if not predictions:
         await message.answer(f"Нет вариантов с коэффициентом >= {MIN_ODDS}.")
@@ -127,11 +134,14 @@ async def analyze(message: types.Message) -> None:
         await message.answer(format_prediction(item))
 
 
+async def send_analyze_progress(message: types.Message, timeout_seconds: int = 10) -> None:
+    await asyncio.sleep(timeout_seconds)
+    await message.answer("Анализ ещё выполняется...")
+
+
 async def main() -> None:
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(main())
