@@ -25,6 +25,7 @@ PARI_USER_AGENT = os.getenv(
 )
 PARI_ACCEPT_LANGUAGE = os.getenv("PARI_ACCEPT_LANGUAGE", "ru-RU,ru;q=0.9,en;q=0.8")
 MIN_ODDS = 1.6
+MAX_ODDS = 2.4
 
 if not TOKEN:
     raise RuntimeError("Заполни TELEGRAM_BOT_TOKEN в переменных окружения")
@@ -118,6 +119,220 @@ def first_non_empty(data: dict[str, Any], keys: tuple[str, ...]) -> str:
 def contains_any_keyword(text: str, keywords: tuple[str, ...]) -> bool:
     lowered = text.lower()
     return any(keyword in lowered for keyword in keywords)
+
+
+def detect_esports_game(
+    event: dict[str, Any],
+    sport_by_id: dict[str, dict[str, Any]],
+    kind_by_id: dict[str, dict[str, Any]],
+    category_by_id: dict[str, dict[str, Any]],
+    tournament_by_id: dict[str, dict[str, Any]],
+) -> str | None:
+    event_caption = first_non_empty(event, ("caption",))
+    sport = sport_by_id.get(str(event.get("sportId")))
+    sport_name = first_non_empty(sport or {}, ("name", "caption", "title"))
+    sport_kind = kind_by_id.get(str(event.get("sportKindId")))
+    sport_kind_name = first_non_empty(sport_kind or {}, ("name", "caption", "title"))
+    category = category_by_id.get(str(event.get("sportCategoryId") or event.get("categoryId")))
+    category_caption = first_non_empty(category or {}, ("caption", "name", "title"))
+    tournament = tournament_by_id.get(str(event.get("tournamentId") or event.get("tournamentInfoId")))
+    tournament_caption = first_non_empty(tournament or {}, ("caption", "name", "title"))
+
+    esports_haystack = " ".join(
+        part
+        for part in (
+            event_caption,
+            sport_name,
+            sport_kind_name,
+            category_caption,
+            tournament_caption,
+        )
+        if part
+    )
+    if contains_any_keyword(esports_haystack, DOTA_KEYWORDS):
+        return "Dota 2"
+    if contains_any_keyword(esports_haystack, CS2_KEYWORDS):
+        return "CS2"
+    return None
+
+
+def stringify(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def walk_values(node: Any):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield key, value
+            yield from walk_values(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from walk_values(item)
+
+
+def factor_related_to_event(factor: dict[str, Any], event_id: str) -> bool:
+    if not event_id:
+        return False
+    related_id_keys = {
+        "eventid",
+        "event_id",
+        "matchid",
+        "match_id",
+        "sporteventid",
+        "parenteventid",
+        "parent_id",
+        "objectid",
+    }
+    for key, value in walk_values(factor):
+        normalized_key = key.lower().replace("-", "").replace(".", "")
+        if normalized_key in related_id_keys:
+            if stringify(value) == event_id:
+                return True
+        if isinstance(value, list) and "event" in normalized_key and any(stringify(item) == event_id for item in value):
+            return True
+    return False
+
+
+def normalize_market_name(name: str) -> str:
+    return name.lower().replace("ё", "е").strip()
+
+
+def market_allowed(market_name: str) -> bool:
+    lowered = normalize_market_name(market_name)
+    if not lowered:
+        return False
+    if ("winner" in lowered) or ("побед" in lowered):
+        return True
+    if ("map" in lowered or "карт" in lowered) and ("handicap" in lowered or "фора" in lowered):
+        return True
+    if ("kills" in lowered or "убий" in lowered) and "total" in lowered:
+        return True
+    if ("maps" in lowered or "карт" in lowered) and "total" in lowered:
+        return True
+    if "тотал" in lowered or "total" in lowered:
+        return True
+    return False
+
+
+def extract_factor_entries(node: Any, parent_market: str = "") -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    if isinstance(node, dict):
+        current_market = stringify(
+            node.get("marketName")
+            or node.get("market")
+            or node.get("factorName")
+            or node.get("factor")
+            or node.get("groupName")
+            or node.get("betName")
+        ) or parent_market
+        odds = parse_odds_value(
+            node.get("price")
+            or node.get("value")
+            or node.get("odds")
+            or node.get("coefficient")
+            or node.get("k")
+            or node.get("kf")
+        )
+        if odds is not None:
+            entries.append(
+                {
+                    "market": current_market,
+                    "selection": stringify(
+                        node.get("selection")
+                        or node.get("outcome")
+                        or node.get("name")
+                        or node.get("caption")
+                        or node.get("title")
+                        or "Выбор не указан"
+                    ),
+                    "odds": odds,
+                }
+            )
+        for value in node.values():
+            entries.extend(extract_factor_entries(value, current_market))
+    elif isinstance(node, list):
+        for item in node:
+            entries.extend(extract_factor_entries(item, parent_market))
+    return entries
+
+
+def collect_relevant_custom_factor_entries(payload: Any) -> dict[str, Any]:
+    result = {
+        "predictions": [],
+        "dota_related_factors": 0,
+        "cs2_related_factors": 0,
+        "factor_samples": [],
+    }
+    if not isinstance(payload, dict):
+        return result
+
+    sports = collect_collection(payload, "sports")
+    sport_kinds = collect_collection(payload, "sportKinds")
+    tournaments = collect_collection(payload, "tournamentInfos")
+    sport_categories = collect_collection(payload, "sportCategories")
+    events = collect_collection(payload, "events")
+    custom_factors = collect_collection(payload, "customFactors")
+
+    sport_by_id = dict_by_id(sports)
+    kind_by_id = dict_by_id(sport_kinds)
+    category_by_id = dict_by_id(sport_categories)
+    tournament_by_id = dict_by_id(tournaments)
+
+    seen_predictions: set[tuple[str, str, str, str, str]] = set()
+    sample_factors: list[dict[str, Any]] = []
+
+    for event in events:
+        game = detect_esports_game(event, sport_by_id, kind_by_id, category_by_id, tournament_by_id)
+        if game is None:
+            continue
+        event_id = stringify(event.get("id"))
+        event_name = first_non_empty(event, ("name", "eventName", "title", "matchName"))
+        team1 = first_non_empty(event, ("team1", "team1Name", "homeTeamName"))
+        team2 = first_non_empty(event, ("team2", "team2Name", "awayTeamName"))
+        match = event_name or " vs ".join(part for part in (team1, team2) if part) or "Unknown match"
+
+        related_factors = [factor for factor in custom_factors if factor_related_to_event(factor, event_id)]
+        if game == "Dota 2":
+            result["dota_related_factors"] += len(related_factors)
+        else:
+            result["cs2_related_factors"] += len(related_factors)
+
+        for factor in related_factors:
+            entries = extract_factor_entries(factor)
+            for entry in entries:
+                market = entry["market"] or "Рынок не указан"
+                odds = entry["odds"]
+                if odds < MIN_ODDS or odds > MAX_ODDS:
+                    continue
+                if not market_allowed(market):
+                    continue
+                selection = entry["selection"] or "Выбор не указан"
+                signature = (game, match, market, selection, f"{odds:.3f}")
+                if signature in seen_predictions:
+                    continue
+                seen_predictions.add(signature)
+                result["predictions"].append(
+                    {
+                        "game": game,
+                        "match": match,
+                        "market": market,
+                        "selection": selection,
+                        "odds": odds,
+                    }
+                )
+                if len(sample_factors) < 5:
+                    sample_factors.append(
+                        {
+                            "event_id": event_id,
+                            "event": match,
+                            "market": market,
+                            "selection": selection,
+                            "odds": odds,
+                        }
+                    )
+
+    result["factor_samples"] = sample_factors
+    return result
 
 
 def extract_esports_diagnostics(payload: Any) -> dict[str, Any]:
@@ -297,6 +512,7 @@ def fetch_pari_line_debug(url: str) -> dict[str, Any]:
     events_value = find_key(json_payload, "events") if is_json else None
     custom_factors_value = find_key(json_payload, "customFactors") if is_json else None
     esports_info = extract_esports_diagnostics(json_payload) if is_json else extract_esports_diagnostics(None)
+    factor_info = collect_relevant_custom_factor_entries(json_payload) if is_json else collect_relevant_custom_factor_entries(None)
 
     return {
         "requested_url": response.url,
@@ -312,6 +528,11 @@ def fetch_pari_line_debug(url: str) -> dict[str, Any]:
         "events_count": value_count(events_value),
         "custom_factors_count": value_count(custom_factors_value),
         "esports": esports_info,
+        "custom_factor_links": {
+            "dota_related_factors": factor_info["dota_related_factors"],
+            "cs2_related_factors": factor_info["cs2_related_factors"],
+            "samples": factor_info["factor_samples"],
+        },
     }
 
 
@@ -362,99 +583,7 @@ def parse_odds_value(value: Any) -> float | None:
 
 
 def extract_real_matches(payload: Any) -> list[dict[str, Any]]:
-    if not isinstance(payload, dict):
-        return []
-
-    sports = collect_collection(payload, "sports")
-    sport_kinds = collect_collection(payload, "sportKinds")
-    tournaments = collect_collection(payload, "tournamentInfos")
-    sport_categories = collect_collection(payload, "sportCategories")
-    events = collect_collection(payload, "events")
-
-    sport_by_id = dict_by_id(sports)
-    kind_by_id = dict_by_id(sport_kinds)
-    category_by_id = dict_by_id(sport_categories)
-    tournament_by_id = dict_by_id(tournaments)
-
-    predictions: list[dict[str, Any]] = []
-
-    for event in events:
-        event_name = first_non_empty(event, ("name", "eventName", "title", "matchName"))
-        team1 = first_non_empty(event, ("team1", "team1Name", "homeTeamName"))
-        team2 = first_non_empty(event, ("team2", "team2Name", "awayTeamName"))
-        event_caption = first_non_empty(event, ("caption",))
-
-        sport = sport_by_id.get(str(event.get("sportId")))
-        sport_name = first_non_empty(sport or {}, ("name", "caption", "title"))
-
-        sport_kind = kind_by_id.get(str(event.get("sportKindId")))
-        sport_kind_name = first_non_empty(sport_kind or {}, ("name", "caption", "title"))
-
-        category = category_by_id.get(str(event.get("sportCategoryId") or event.get("categoryId")))
-        category_caption = first_non_empty(category or {}, ("caption", "name", "title"))
-
-        tournament = tournament_by_id.get(str(event.get("tournamentId") or event.get("tournamentInfoId")))
-        tournament_caption = first_non_empty(tournament or {}, ("caption", "name", "title"))
-
-        esports_haystack = " ".join(
-            part
-            for part in (
-                event_caption,
-                sport_name,
-                sport_kind_name,
-                category_caption,
-                tournament_caption,
-            )
-            if part
-        )
-
-        is_dota = contains_any_keyword(esports_haystack, DOTA_KEYWORDS)
-        is_cs2 = contains_any_keyword(esports_haystack, CS2_KEYWORDS)
-        if not (is_dota or is_cs2):
-            continue
-
-        game = "Dota 2" if is_dota else "CS2"
-        match = event_name or " vs ".join(part for part in (team1, team2) if part) or "Unknown match"
-        markets = event.get("markets")
-        if not isinstance(markets, list):
-            continue
-
-        for market in markets:
-            if not isinstance(market, dict):
-                continue
-            market_name = str(market.get("name") or market.get("marketName") or "").strip()
-            outcomes = market.get("outcomes")
-            if not isinstance(outcomes, list):
-                continue
-
-            for outcome in outcomes:
-                if not isinstance(outcome, dict):
-                    continue
-                odds = parse_odds_value(
-                    outcome.get("price")
-                    or outcome.get("value")
-                    or outcome.get("odds")
-                )
-                if odds is None or odds < MIN_ODDS:
-                    continue
-
-                selection = str(
-                    outcome.get("name")
-                    or outcome.get("caption")
-                    or outcome.get("title")
-                    or "Выбор не указан"
-                )
-                predictions.append(
-                    {
-                        "game": game,
-                        "match": match,
-                        "market": market_name or "Рынок не указан",
-                        "selection": selection,
-                        "odds": odds,
-                    }
-                )
-
-    return predictions
+    return collect_relevant_custom_factor_entries(payload)["predictions"]
 
 
 def fetch_real_pari_matches(url: str) -> list[dict[str, Any]]:
@@ -632,6 +761,9 @@ async def debug_pari(message: types.Message) -> None:
         f"Киберспорт events всего: {debug_data['esports']['total_events']}\n"
         f"Dota 2 events: {debug_data['esports']['dota2_events']}\n"
         f"CS2 events: {debug_data['esports']['cs2_events']}\n"
+        f"customFactors привязано к Dota 2 events: {debug_data['custom_factor_links']['dota_related_factors']}\n"
+        f"customFactors привязано к CS2 events: {debug_data['custom_factor_links']['cs2_related_factors']}\n"
+        f"Примеры factors+odds (до 5): {compact_json(debug_data['custom_factor_links']['samples'])}\n"
         f"Использованы заголовки: {json.dumps(debug_data['request_headers_used'], ensure_ascii=False)}\n"
         f"Dota 2 samples: {compact_json(debug_data['esports']['dota2_samples'])}\n"
         f"CS2 samples: {compact_json(debug_data['esports']['cs2_samples'])}\n\n"
