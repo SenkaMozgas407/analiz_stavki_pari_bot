@@ -7,6 +7,8 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from dotenv import load_dotenv
 
+from pari_parser import PariUnavailableError, fetch_pari_matches
+
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -110,13 +112,17 @@ async def show_id(message: types.Message) -> None:
 
 @dp.message(Command("analyze"))
 async def analyze(message: types.Message) -> None:
-    await message.answer("Запускаю анализ mock-данных...")
+    await message.answer("Запускаю анализ матчей...")
 
     try:
-        predictions = load_sample_matches()
-    except Exception as exc:
-        await message.answer(f"Ошибка чтения mock-данных: {exc}")
-        return
+        predictions = fetch_pari_matches(min_odds=MIN_ODDS)
+    except PariUnavailableError:
+        await message.answer("PARI временно недоступен, использую резервные данные.")
+        try:
+            predictions = load_sample_matches()
+        except Exception as exc:
+            await message.answer(f"Ошибка чтения mock-данных: {exc}")
+            return
 
     if not predictions:
         await message.answer(f"Нет вариантов с коэффициентом >= {MIN_ODDS}.")
