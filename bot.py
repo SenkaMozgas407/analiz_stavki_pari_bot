@@ -2,15 +2,18 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+import asyncio
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from dotenv import load_dotenv
+import requests
 
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SAMPLE_DATA_PATH = Path(os.getenv("SAMPLE_DATA_PATH", "data/sample_matches.json"))
+PARI_LINE_URL = os.getenv("PARI_LINE_URL")
 MIN_ODDS = 1.6
 
 if not TOKEN:
@@ -18,6 +21,63 @@ if not TOKEN:
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
+
+
+def truncate_text(value: str, limit: int = 1000) -> str:
+    return value if len(value) <= limit else f"{value[:limit]}..."
+
+
+def find_key(data: Any, target_key: str) -> Any | None:
+    if isinstance(data, dict):
+        if target_key in data:
+            return data[target_key]
+        for value in data.values():
+            found = find_key(value, target_key)
+            if found is not None:
+                return found
+    elif isinstance(data, list):
+        for item in data:
+            found = find_key(item, target_key)
+            if found is not None:
+                return found
+    return None
+
+
+def value_count(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value)
+    return 1
+
+
+def fetch_pari_line_debug(url: str) -> dict[str, Any]:
+    response = requests.get(url, timeout=20)
+    body = response.text
+    json_payload: Any | None = None
+
+    try:
+        json_payload = response.json()
+        is_json = True
+    except ValueError:
+        is_json = False
+
+    sports_value = find_key(json_payload, "sports") if is_json else None
+    events_value = find_key(json_payload, "events") if is_json else None
+    custom_factors_value = find_key(json_payload, "customFactors") if is_json else None
+
+    return {
+        "requested_url": response.url,
+        "status_code": response.status_code,
+        "response_preview": truncate_text(body, 1000),
+        "is_json": is_json,
+        "has_sports": sports_value is not None,
+        "has_events": events_value is not None,
+        "has_custom_factors": custom_factors_value is not None,
+        "sports_count": value_count(sports_value),
+        "events_count": value_count(events_value),
+        "custom_factors_count": value_count(custom_factors_value),
+    }
 
 
 def load_sample_matches() -> list[dict[str, Any]]:
@@ -99,7 +159,8 @@ async def start(message: types.Message) -> None:
         "Команды:\n"
         "/start — список команд\n"
         "/id — показать chat id\n"
-        "/analyze — анализ mock-данных"
+        "/analyze — анализ mock-данных\n"
+        "/debug_pari — диагностика PARI endpoint"
     )
 
 
@@ -127,11 +188,42 @@ async def analyze(message: types.Message) -> None:
         await message.answer(format_prediction(item))
 
 
+@dp.message(Command("debug_pari"))
+async def debug_pari(message: types.Message) -> None:
+    if not PARI_LINE_URL:
+        await message.answer(
+            "PARI_LINE_URL не задан в .env.\n"
+            "Укажи полный URL endpoint, например:\n"
+            "PARI_LINE_URL=https://clientsapi.../line/list?lang=ru&version=...&scopeMarket=2300"
+        )
+        return
+
+    await message.answer("Запускаю диагностику PARI endpoint...")
+
+    try:
+        debug_data = await asyncio.to_thread(fetch_pari_line_debug, PARI_LINE_URL)
+    except Exception as exc:
+        await message.answer(f"Ошибка запроса к PARI endpoint: {exc}")
+        return
+
+    await message.answer(
+        "🔎 Диагностика PARI\n"
+        f"URL: {debug_data['requested_url']}\n"
+        f"Status code: {debug_data['status_code']}\n"
+        f"JSON найден: {'да' if debug_data['is_json'] else 'нет'}\n"
+        f"Ключ sports: {'да' if debug_data['has_sports'] else 'нет'}\n"
+        f"Ключ events: {'да' if debug_data['has_events'] else 'нет'}\n"
+        f"Ключ customFactors: {'да' if debug_data['has_custom_factors'] else 'нет'}\n"
+        f"Количество sports: {debug_data['sports_count']}\n"
+        f"Количество events: {debug_data['events_count']}\n"
+        f"Количество customFactors: {debug_data['custom_factors_count']}\n\n"
+        f"Первые 1000 символов ответа:\n{debug_data['response_preview']}"
+    )
+
+
 async def main() -> None:
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(main())
