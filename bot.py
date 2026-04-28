@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from collections import Counter
 import asyncio
 import logging
 
@@ -70,6 +71,55 @@ def value_count(value: Any) -> int:
     return 1
 
 
+ESPORTS_KEYWORDS = (
+    "dota",
+    "дота",
+    "counter",
+    "counter-strike",
+    "counter strike",
+    "counterstrike",
+    "cs2",
+    "cs:go",
+    "кибер",
+    "cyber",
+    "esports",
+    "e-sports",
+    "e sports",
+)
+DOTA_KEYWORDS = ("dota", "дота")
+CS2_KEYWORDS = ("cs2", "counter-strike", "counter strike", "counterstrike", "cs:go", "кс")
+
+
+def collect_collection(payload: Any, key: str) -> list[dict[str, Any]]:
+    value = find_key(payload, key)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def dict_by_id(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    indexed: dict[str, dict[str, Any]] = {}
+    for item in items:
+        item_id = item.get("id")
+        if item_id is None:
+            continue
+        indexed[str(item_id)] = item
+    return indexed
+
+
+def first_non_empty(data: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def contains_any_keyword(text: str, keywords: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in keywords)
+
+
 def extract_esports_diagnostics(payload: Any) -> dict[str, Any]:
     diagnostics = {
         "total_events": 0,
@@ -77,44 +127,102 @@ def extract_esports_diagnostics(payload: Any) -> dict[str, Any]:
         "cs2_events": 0,
         "dota2_samples": [],
         "cs2_samples": [],
+        "sports_samples": [],
+        "sport_kinds_samples": [],
+        "tournament_esports_samples": [],
+        "event_esports_samples": [],
+        "top_sport_names": [],
     }
     if not isinstance(payload, dict):
         return diagnostics
 
-    events = find_key(payload, "events")
-    if not isinstance(events, list):
-        return diagnostics
+    sports = collect_collection(payload, "sports")
+    sport_kinds = collect_collection(payload, "sportKinds")
+    tournaments = collect_collection(payload, "tournamentInfos")
+    sport_categories = collect_collection(payload, "sportCategories")
+    events = collect_collection(payload, "events")
 
     diagnostics["total_events"] = len(events)
 
-    for event in events:
-        if not isinstance(event, dict):
-            continue
+    sport_by_id = dict_by_id(sports)
+    kind_by_id = dict_by_id(sport_kinds)
+    category_by_id = dict_by_id(sport_categories)
+    tournament_by_id = dict_by_id(tournaments)
 
-        event_name = str(
-            event.get("name")
-            or event.get("eventName")
-            or event.get("title")
-            or event.get("matchName")
-            or "Unknown"
+    diagnostics["sports_samples"] = [
+        first_non_empty(item, ("name", "caption", "title")) for item in sports if first_non_empty(item, ("name", "caption", "title"))
+    ][:30]
+    diagnostics["sport_kinds_samples"] = [
+        {
+            "name": first_non_empty(item, ("name", "title")),
+            "caption": first_non_empty(item, ("caption",)),
+        }
+        for item in sport_kinds
+        if first_non_empty(item, ("name", "title")) or first_non_empty(item, ("caption",))
+    ][:30]
+
+    tournament_samples: list[dict[str, str]] = []
+    for tournament in tournaments:
+        name = first_non_empty(tournament, ("name", "caption", "title"))
+        if contains_any_keyword(name, ESPORTS_KEYWORDS):
+            tournament_samples.append(
+                {
+                    "id": str(tournament.get("id", "")),
+                    "name": name,
+                }
+            )
+        if len(tournament_samples) >= 30:
+            break
+    diagnostics["tournament_esports_samples"] = tournament_samples
+
+    sport_counter: Counter[str] = Counter()
+
+    for sport in sports:
+        sport_name = first_non_empty(sport, ("name", "caption", "title"))
+        if sport_name:
+            sport_counter[sport_name] += 1
+
+    event_keyword_samples: list[dict[str, str]] = []
+
+    for event in events:
+        event_name = first_non_empty(event, ("name", "eventName", "title", "matchName"))
+        team1 = first_non_empty(event, ("team1", "team1Name", "homeTeamName"))
+        team2 = first_non_empty(event, ("team2", "team2Name", "awayTeamName"))
+        event_caption = first_non_empty(event, ("caption",))
+
+        sport = sport_by_id.get(str(event.get("sportId")))
+        sport_name = first_non_empty(sport or {}, ("name", "caption", "title"))
+
+        sport_kind = kind_by_id.get(str(event.get("sportKindId")))
+        sport_kind_name = first_non_empty(sport_kind or {}, ("name", "caption", "title"))
+
+        category = category_by_id.get(str(event.get("sportCategoryId") or event.get("categoryId")))
+        category_caption = first_non_empty(category or {}, ("caption", "name", "title"))
+
+        tournament = tournament_by_id.get(str(event.get("tournamentId") or event.get("tournamentInfoId")))
+        tournament_caption = first_non_empty(tournament or {}, ("caption", "name", "title"))
+
+        haystack = " ".join(
+            part
+            for part in (
+                event_name,
+                team1,
+                team2,
+                event_caption,
+                sport_name,
+                sport_kind_name,
+                category_caption,
+                tournament_caption,
+            )
+            if part
         )
-        competition = str(
-            event.get("competitionName")
-            or event.get("leagueName")
-            or event.get("categoryName")
-            or ""
-        )
-        sport = str(
-            event.get("sportName")
-            or event.get("sport")
-            or event.get("gameName")
-            or ""
-        )
-        haystack = f"{event_name} {competition} {sport}".lower()
+
+        for candidate in (sport_name, sport_kind_name):
+            if candidate:
+                sport_counter[candidate] += 1
 
         market_name = ""
         odds_value = ""
-
         markets = event.get("markets")
         if isinstance(markets, list) and markets:
             first_market = markets[0]
@@ -133,22 +241,41 @@ def extract_esports_diagnostics(payload: Any) -> dict[str, Any]:
 
         sample = {
             "match": event_name,
-            "competition": competition,
+            "team1": team1,
+            "team2": team2,
+            "competition": tournament_caption or category_caption,
+            "sport": sport_name or sport_kind_name,
             "market": market_name,
             "odds": odds_value,
         }
 
-        if "dota" in haystack:
+        if contains_any_keyword(haystack, DOTA_KEYWORDS):
             diagnostics["dota2_events"] += 1
             if len(diagnostics["dota2_samples"]) < 3:
                 diagnostics["dota2_samples"].append(sample)
 
-        if any(token in haystack for token in ("cs2", "counter-strike 2", "counter strike 2", "counter-strike")):
+        if contains_any_keyword(haystack, CS2_KEYWORDS):
             diagnostics["cs2_events"] += 1
             if len(diagnostics["cs2_samples"]) < 3:
                 diagnostics["cs2_samples"].append(sample)
 
+        if contains_any_keyword(" ".join((event_name, team1, team2, event_caption)), ESPORTS_KEYWORDS):
+            if len(event_keyword_samples) < 30:
+                event_keyword_samples.append(sample)
+
+    diagnostics["event_esports_samples"] = event_keyword_samples
+    diagnostics["top_sport_names"] = [
+        {"name": name, "count": count}
+        for name, count in sport_counter.most_common(50)
+    ]
+
     return diagnostics
+
+
+def compact_json(value: Any, limit: int = 2000) -> str:
+    return truncate_text(json.dumps(value, ensure_ascii=False), limit)
+
+
 
 
 def fetch_pari_line_debug(url: str) -> dict[str, Any]:
@@ -369,9 +496,24 @@ async def debug_pari(message: types.Message) -> None:
         f"Dota 2 events: {debug_data['esports']['dota2_events']}\n"
         f"CS2 events: {debug_data['esports']['cs2_events']}\n"
         f"Использованы заголовки: {json.dumps(debug_data['request_headers_used'], ensure_ascii=False)}\n"
-        f"Dota 2 samples: {json.dumps(debug_data['esports']['dota2_samples'], ensure_ascii=False)}\n"
-        f"CS2 samples: {json.dumps(debug_data['esports']['cs2_samples'], ensure_ascii=False)}\n\n"
+        f"Dota 2 samples: {compact_json(debug_data['esports']['dota2_samples'])}\n"
+        f"CS2 samples: {compact_json(debug_data['esports']['cs2_samples'])}\n\n"
         f"Первые 1000 символов ответа:\n{debug_data['response_preview']}"
+    )
+
+    await safe_send(
+        message,
+        "🧪 Киберспорт samples (до 30):\n"
+        f"sports names: {compact_json(debug_data['esports']['sports_samples'])}\n"
+        f"sportKinds name/caption: {compact_json(debug_data['esports']['sport_kinds_samples'])}\n"
+        f"tournamentInfos by keywords: {compact_json(debug_data['esports']['tournament_esports_samples'])}\n"
+        f"events by keywords (name/team1/team2/caption): {compact_json(debug_data['esports']['event_esports_samples'])}"
+    )
+
+    await safe_send(
+        message,
+        "📊 Top 50 sport names/captions (temporary):\n"
+        f"{compact_json(debug_data['esports']['top_sport_names'])}"
     )
 
 
