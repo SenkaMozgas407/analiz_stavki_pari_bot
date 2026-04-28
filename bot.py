@@ -3,9 +3,12 @@ import os
 from pathlib import Path
 from typing import Any
 import asyncio
+import logging
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramNetworkError
+from aiogram.client.session.aiohttp import AiohttpSession
 from dotenv import load_dotenv
 import requests
 
@@ -19,7 +22,17 @@ MIN_ODDS = 1.6
 if not TOKEN:
     raise RuntimeError("Заполни TELEGRAM_BOT_TOKEN в переменных окружения")
 
-bot = Bot(token=TOKEN)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+TELEGRAM_REQUEST_TIMEOUT = int(os.getenv("TELEGRAM_REQUEST_TIMEOUT", "60"))
+SEND_RETRY_ATTEMPTS = int(os.getenv("SEND_RETRY_ATTEMPTS", "3"))
+SEND_RETRY_DELAY_SECONDS = float(os.getenv("SEND_RETRY_DELAY_SECONDS", "1.5"))
+
+bot = Bot(token=TOKEN, session=AiohttpSession(timeout=TELEGRAM_REQUEST_TIMEOUT))
 dp = Dispatcher()
 
 
@@ -152,9 +165,43 @@ def format_prediction(item: dict[str, Any]) -> str:
     )
 
 
+async def safe_send(
+    message: types.Message,
+    text: str,
+    *,
+    attempts: int = SEND_RETRY_ATTEMPTS,
+    retry_delay: float = SEND_RETRY_DELAY_SECONDS,
+) -> None:
+    for attempt in range(1, attempts + 1):
+        try:
+            await message.answer(text)
+            return
+        except TelegramNetworkError as exc:
+            logger.warning(
+                "Telegram timeout/network error while sending message "
+                "(attempt %s/%s, chat_id=%s): %s",
+                attempt,
+                attempts,
+                message.chat.id,
+                exc,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(retry_delay)
+                continue
+            logger.error(
+                "Failed to send message after %s attempts (chat_id=%s).",
+                attempts,
+                message.chat.id,
+            )
+        except Exception:
+            logger.exception("Unexpected error while sending message (chat_id=%s).", message.chat.id)
+        return
+
+
 @dp.message(Command("start"))
 async def start(message: types.Message) -> None:
-    await message.answer(
+    await safe_send(
+        message,
         "Бот работает стабильно ✅\n\n"
         "Команды:\n"
         "/start — список команд\n"
@@ -166,47 +213,49 @@ async def start(message: types.Message) -> None:
 
 @dp.message(Command("id"))
 async def show_id(message: types.Message) -> None:
-    await message.answer(f"Ваш chat_id: {message.chat.id}")
+    await safe_send(message, f"Ваш chat_id: {message.chat.id}")
 
 
 @dp.message(Command("analyze"))
 async def analyze(message: types.Message) -> None:
-    await message.answer("Запускаю анализ mock-данных...")
+    await safe_send(message, "Запускаю анализ mock-данных...")
 
     try:
         predictions = load_sample_matches()
     except Exception as exc:
-        await message.answer(f"Ошибка чтения mock-данных: {exc}")
+        await safe_send(message, f"Ошибка чтения mock-данных: {exc}")
         return
 
     if not predictions:
-        await message.answer(f"Нет вариантов с коэффициентом >= {MIN_ODDS}.")
+        await safe_send(message, f"Нет вариантов с коэффициентом >= {MIN_ODDS}.")
         return
 
-    await message.answer(f"Найдено вариантов: {len(predictions)}")
+    await safe_send(message, f"Найдено вариантов: {len(predictions)}")
     for item in predictions:
-        await message.answer(format_prediction(item))
+        await safe_send(message, format_prediction(item))
 
 
 @dp.message(Command("debug_pari"))
 async def debug_pari(message: types.Message) -> None:
     if not PARI_LINE_URL:
-        await message.answer(
+        await safe_send(
+            message,
             "PARI_LINE_URL не задан в .env.\n"
             "Укажи полный URL endpoint, например:\n"
             "PARI_LINE_URL=https://clientsapi.../line/list?lang=ru&version=...&scopeMarket=2300"
         )
         return
 
-    await message.answer("Запускаю диагностику PARI endpoint...")
+    await safe_send(message, "Запускаю диагностику PARI endpoint...")
 
     try:
         debug_data = await asyncio.to_thread(fetch_pari_line_debug, PARI_LINE_URL)
     except Exception as exc:
-        await message.answer(f"Ошибка запроса к PARI endpoint: {exc}")
+        await safe_send(message, f"Ошибка запроса к PARI endpoint: {exc}")
         return
 
-    await message.answer(
+    await safe_send(
+        message,
         "🔎 Диагностика PARI\n"
         f"URL: {debug_data['requested_url']}\n"
         f"Status code: {debug_data['status_code']}\n"
