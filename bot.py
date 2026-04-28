@@ -1,9 +1,12 @@
+import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
 from aiogram import Bot, Dispatcher, types
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command
 from dotenv import load_dotenv
 
@@ -18,6 +21,7 @@ if not TOKEN:
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
+logger = logging.getLogger(__name__)
 
 
 def load_sample_matches() -> list[dict[str, Any]]:
@@ -92,9 +96,33 @@ def format_prediction(item: dict[str, Any]) -> str:
     )
 
 
+async def safe_send(message: types.Message, text: str) -> None:
+    max_attempts = 3
+    retry_delay_seconds = 2
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await message.answer(text)
+            return
+        except TelegramNetworkError as exc:
+            if "timeout" not in str(exc).lower():
+                raise
+
+            if attempt < max_attempts:
+                await asyncio.sleep(retry_delay_seconds)
+                continue
+
+            logger.exception(
+                "Не удалось отправить сообщение после %s попыток из-за timeout: %s",
+                max_attempts,
+                exc,
+            )
+
+
 @dp.message(Command("start"))
 async def start(message: types.Message) -> None:
-    await message.answer(
+    await safe_send(
+        message,
         "Бот работает стабильно ✅\n\n"
         "Команды:\n"
         "/start — список команд\n"
@@ -105,26 +133,26 @@ async def start(message: types.Message) -> None:
 
 @dp.message(Command("id"))
 async def show_id(message: types.Message) -> None:
-    await message.answer(f"Ваш chat_id: {message.chat.id}")
+    await safe_send(message, f"Ваш chat_id: {message.chat.id}")
 
 
 @dp.message(Command("analyze"))
 async def analyze(message: types.Message) -> None:
-    await message.answer("Запускаю анализ mock-данных...")
+    await safe_send(message, "Запускаю анализ mock-данных...")
 
     try:
         predictions = load_sample_matches()
     except Exception as exc:
-        await message.answer(f"Ошибка чтения mock-данных: {exc}")
+        await safe_send(message, f"Ошибка чтения mock-данных: {exc}")
         return
 
     if not predictions:
-        await message.answer(f"Нет вариантов с коэффициентом >= {MIN_ODDS}.")
+        await safe_send(message, f"Нет вариантов с коэффициентом >= {MIN_ODDS}.")
         return
 
-    await message.answer(f"Найдено вариантов: {len(predictions)}")
+    await safe_send(message, f"Найдено вариантов: {len(predictions)}")
     for item in predictions:
-        await message.answer(format_prediction(item))
+        await safe_send(message, format_prediction(item))
 
 
 async def main() -> None:
@@ -132,6 +160,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(main())
