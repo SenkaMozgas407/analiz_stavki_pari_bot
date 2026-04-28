@@ -193,6 +193,62 @@ def factor_related_to_event(factor: dict[str, Any], event_id: str) -> bool:
     return False
 
 
+def event_id_from_custom_factor_block(factor: dict[str, Any]) -> str:
+    block = factor.get("block")
+    if not isinstance(block, dict):
+        return ""
+    direct_id = block.get("e")
+    if direct_id not in (None, ""):
+        return stringify(direct_id)
+    alt_id = block.get("eventId")
+    if alt_id not in (None, ""):
+        return stringify(alt_id)
+    return ""
+
+
+def parse_factor_code(value: Any) -> str:
+    normalized = stringify(value)
+    return normalized
+
+
+KNOWN_FACTOR_MARKETS = {
+    "921": "Победа в матче",
+    "923": "Фора по картам",
+    "927": "Тотал карт",
+    "928": "Тотал раундов/киллов",
+    "930": "Победа на карте",
+    "931": "Фора по раундам/киллам",
+}
+
+
+def market_and_selection_from_factor(factor_code: str, factor_payload: dict[str, Any]) -> tuple[str, str]:
+    known_market = KNOWN_FACTOR_MARKETS.get(factor_code)
+    if known_market:
+        return known_market, f"Исход {factor_code}"
+    return f"Рынок PARI #{factor_code or '?'}", f"Исход/рынок #{factor_code or '?'}"
+
+
+def extract_factor_candidates(node: Any) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    if isinstance(node, dict):
+        factor_code = parse_factor_code(node.get("f"))
+        odds = parse_odds_value(node.get("v"))
+        if factor_code and odds is not None:
+            candidates.append(
+                {
+                    "f": factor_code,
+                    "v": odds,
+                    "pt": stringify(node.get("pt")),
+                }
+            )
+        for value in node.values():
+            candidates.extend(extract_factor_candidates(value))
+    elif isinstance(node, list):
+        for item in node:
+            candidates.extend(extract_factor_candidates(item))
+    return candidates
+
+
 def normalize_market_name(name: str) -> str:
     return name.lower().replace("ё", "е").strip()
 
@@ -259,8 +315,13 @@ def extract_factor_entries(node: Any, parent_market: str = "") -> list[dict[str,
 def collect_relevant_custom_factor_entries(payload: Any) -> dict[str, Any]:
     result = {
         "predictions": [],
-        "dota_related_factors": 0,
-        "cs2_related_factors": 0,
+        "dota_events": 0,
+        "cs2_events": 0,
+        "events_with_custom_factors": 0,
+        "factors_total_found": 0,
+        "factors_with_min_odds": 0,
+        "event_ids": [],
+        "event_ids_with_custom_factors": [],
         "factor_samples": [],
     }
     if not isinstance(payload, dict):
@@ -278,35 +339,60 @@ def collect_relevant_custom_factor_entries(payload: Any) -> dict[str, Any]:
     category_by_id = dict_by_id(sport_categories)
     tournament_by_id = dict_by_id(tournaments)
 
-    seen_predictions: set[tuple[str, str, str, str, str]] = set()
-    sample_factors: list[dict[str, Any]] = []
-
+    event_map: dict[str, dict[str, Any]] = {}
     for event in events:
         game = detect_esports_game(event, sport_by_id, kind_by_id, category_by_id, tournament_by_id)
         if game is None:
             continue
         event_id = stringify(event.get("id"))
+        if not event_id:
+            continue
+        event_map[event_id] = event
+        if game == "Dota 2":
+            result["dota_events"] += 1
+        else:
+            result["cs2_events"] += 1
+
+    custom_factors_by_event: dict[str, list[dict[str, Any]]] = {}
+    for factor in custom_factors:
+        linked_event_id = event_id_from_custom_factor_block(factor)
+        if not linked_event_id:
+            for event_id in event_map:
+                if factor_related_to_event(factor, event_id):
+                    linked_event_id = event_id
+                    break
+        if not linked_event_id:
+            continue
+        custom_factors_by_event.setdefault(linked_event_id, []).append(factor)
+
+    seen_predictions: set[tuple[str, str, str, str, str]] = set()
+    sample_factors: list[dict[str, Any]] = []
+
+    for event_id, event in event_map.items():
+        game = detect_esports_game(event, sport_by_id, kind_by_id, category_by_id, tournament_by_id)
+        if game is None:
+            continue
         event_name = first_non_empty(event, ("name", "eventName", "title", "matchName"))
         team1 = first_non_empty(event, ("team1", "team1Name", "homeTeamName"))
         team2 = first_non_empty(event, ("team2", "team2Name", "awayTeamName"))
         match = event_name or " vs ".join(part for part in (team1, team2) if part) or "Unknown match"
 
-        related_factors = [factor for factor in custom_factors if factor_related_to_event(factor, event_id)]
-        if game == "Dota 2":
-            result["dota_related_factors"] += len(related_factors)
-        else:
-            result["cs2_related_factors"] += len(related_factors)
+        related_factors = custom_factors_by_event.get(event_id, [])
+        result["event_ids"].append(event_id)
+        if related_factors:
+            result["events_with_custom_factors"] += 1
+            result["event_ids_with_custom_factors"].append(event_id)
 
         for factor in related_factors:
-            entries = extract_factor_entries(factor)
-            for entry in entries:
-                market = entry["market"] or "Рынок не указан"
-                odds = entry["odds"]
+            factor_candidates = extract_factor_candidates(factor)
+            for candidate in factor_candidates:
+                result["factors_total_found"] += 1
+                odds = candidate["v"]
+                if odds >= MIN_ODDS:
+                    result["factors_with_min_odds"] += 1
                 if odds < MIN_ODDS or odds > MAX_ODDS:
                     continue
-                if not market_allowed(market):
-                    continue
-                selection = entry["selection"] or "Выбор не указан"
+                market, selection = market_and_selection_from_factor(candidate["f"], factor)
                 signature = (game, match, market, selection, f"{odds:.3f}")
                 if signature in seen_predictions:
                     continue
@@ -320,14 +406,16 @@ def collect_relevant_custom_factor_entries(payload: Any) -> dict[str, Any]:
                         "odds": odds,
                     }
                 )
-                if len(sample_factors) < 5:
+                if len(sample_factors) < 10:
                     sample_factors.append(
                         {
                             "event_id": event_id,
-                            "event": match,
+                            "team1": team1,
+                            "team2": team2,
+                            "factor_f": candidate["f"],
+                            "pt": candidate["pt"],
                             "market": market,
-                            "selection": selection,
-                            "odds": odds,
+                            "v": odds,
                         }
                     )
 
@@ -529,8 +617,13 @@ def fetch_pari_line_debug(url: str) -> dict[str, Any]:
         "custom_factors_count": value_count(custom_factors_value),
         "esports": esports_info,
         "custom_factor_links": {
-            "dota_related_factors": factor_info["dota_related_factors"],
-            "cs2_related_factors": factor_info["cs2_related_factors"],
+            "dota_events": factor_info["dota_events"],
+            "cs2_events": factor_info["cs2_events"],
+            "events_with_custom_factors": factor_info["events_with_custom_factors"],
+            "factors_total_found": factor_info["factors_total_found"],
+            "factors_with_min_odds": factor_info["factors_with_min_odds"],
+            "event_ids": factor_info["event_ids"],
+            "event_ids_with_custom_factors": factor_info["event_ids_with_custom_factors"],
             "samples": factor_info["factor_samples"],
         },
     }
@@ -761,9 +854,14 @@ async def debug_pari(message: types.Message) -> None:
         f"Киберспорт events всего: {debug_data['esports']['total_events']}\n"
         f"Dota 2 events: {debug_data['esports']['dota2_events']}\n"
         f"CS2 events: {debug_data['esports']['cs2_events']}\n"
-        f"customFactors привязано к Dota 2 events: {debug_data['custom_factor_links']['dota_related_factors']}\n"
-        f"customFactors привязано к CS2 events: {debug_data['custom_factor_links']['cs2_related_factors']}\n"
-        f"Примеры factors+odds (до 5): {compact_json(debug_data['custom_factor_links']['samples'])}\n"
+        f"Dota+CS2 events: {debug_data['custom_factor_links']['dota_events'] + debug_data['custom_factor_links']['cs2_events']}\n"
+        f"Events с customFactors: {debug_data['custom_factor_links']['events_with_custom_factors']}\n"
+        f"Factors всего найдено: {debug_data['custom_factor_links']['factors_total_found']}\n"
+        f"Factors с v >= {MIN_ODDS}: {debug_data['custom_factor_links']['factors_with_min_odds']}\n"
+        f"Event IDs Dota/CS2: {compact_json(debug_data['custom_factor_links']['event_ids'])}\n"
+        f"Event IDs с customFactors: {compact_json(debug_data['custom_factor_links']['event_ids_with_custom_factors'])}\n"
+        f"Примеры factors (до 10): event id, team1, team2, f, v, pt:\n"
+        f"{compact_json(debug_data['custom_factor_links']['samples'])}\n"
         f"Использованы заголовки: {json.dumps(debug_data['request_headers_used'], ensure_ascii=False)}\n"
         f"Dota 2 samples: {compact_json(debug_data['esports']['dota2_samples'])}\n"
         f"CS2 samples: {compact_json(debug_data['esports']['cs2_samples'])}\n\n"
