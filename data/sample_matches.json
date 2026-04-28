@@ -1,0 +1,37 @@
+[
+  {
+    "game": "Dota 2",
+    "match": "Team Spirit vs Virtus.pro",
+    "market": "Победитель матча",
+    "selection": "Team Spirit",
+    "odds": 1.72
+  },
+  {
+    "game": "CS2",
+    "match": "Natus Vincere vs G2",
+    "market": "Тотал карт",
+    "selection": "Больше 2.5",
+    "odds": 1.95
+  },
+  {
+    "game": "CS2",
+    "match": "FaZe vs MOUZ",
+    "market": "Победа на карте 1",
+    "selection": "MOUZ",
+    "odds": 1.58
+  },
+  {
+    "game": "Dota 2",
+    "match": "BetBoom vs Team Liquid",
+    "market": "Фора по картам",
+    "selection": "Team Liquid (+1.5)",
+    "odds": 1.66
+  },
+  {
+    "game": "Dota 2",
+    "match": "Aurora vs Tundra",
+    "market": "Тотал убийств на карте 1",
+    "selection": "Меньше 48.5",
+    "odds": 2.05
+  }
+]

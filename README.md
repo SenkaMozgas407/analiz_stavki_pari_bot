@@ -1,50 +1,46 @@
-# PARI Telegram Bot
+# Stable MVP Telegram Bot
 
-Telegram-бот для анализа ставок Dota 2 / CS2 по данным PARI JSON/API.
+Минимальный и стабильный Telegram-бот без внешнего парсинга.
 
 ## Что умеет
 
-- Забирает реальные данные матчей и коэффициентов из JSON endpoint'ов PARI.
-- Находит только Dota 2 и CS2 события.
-- Классифицирует рынки: победитель, тоталы, форы, карты.
-- Фильтрует ставки с коэффициентом от `1.6`.
-- Строит прогноз: ставка, причина, вероятность, уверенность, риск.
-- Поддерживает ручной запуск и авто-проверку каждые 30 минут.
+- Команды:
+  - `/start`
+  - `/id`
+  - `/analyze`
+- `/analyze` читает только локальные mock-данные из `data/sample_matches.json`.
+- Фильтр вариантов: `odds >= 1.6`.
+- Для каждого варианта отправляет:
+  - матч
+  - куда ставить
+  - рынок
+  - коэффициент
+  - короткую аналитику
+  - риск
+  - уверенность
+
+## Что убрано
+
+- Полностью убран PARI-парсер.
+- Полностью убран автоспам/авторассылка по расписанию.
 
 ## Файлы
 
-- `bot.py` — Telegram-бот и планировщик авто-проверки.
-- `pari_parser.py` — production-ready JSON/API парсер PARI + аналитика.
+- `bot.py` — Telegram-бот (MVP).
+- `data/sample_matches.json` — mock-данные для команды `/analyze`.
 - `requirements.txt` — зависимости.
 
-## Render
-
-Build Command:
+## Запуск
 
 ```bash
 pip install -r requirements.txt
-```
-
-Start Command:
-
-```bash
 python bot.py
 ```
 
-Environment Variables:
+## Переменные окружения
 
 ```text
-TELEGRAM_BOT_TOKEN=твой_токен_бота
-AUTO_CHECK_INTERVAL_MINUTES=30
-CHAT_STORAGE_PATH=chat_ids.json
-# опционально: свои endpoint'ы через запятую
-PARI_API_URLS=https://api.pari.ru/v2/sports/esports/events,https://api.pari.ru/v1/sports/esports/events
-```
-
-## Команды
-
-```text
-/start
-/id
-/pari
+TELEGRAM_BOT_TOKEN=ваш_токен
+# опционально
+SAMPLE_DATA_PATH=data/sample_matches.json
 ```
