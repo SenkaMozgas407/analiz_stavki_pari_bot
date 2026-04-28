@@ -1,137 +1,137 @@
-import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Set
+from typing import Any
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from dotenv import load_dotenv
 
-from pari_parser import get_pari_esports_odds
-
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-AUTO_CHECK_INTERVAL_MINUTES = int(os.getenv("AUTO_CHECK_INTERVAL_MINUTES", "30"))
-CHAT_STORAGE_PATH = Path(os.getenv("CHAT_STORAGE_PATH", "chat_ids.json"))
+SAMPLE_DATA_PATH = Path(os.getenv("SAMPLE_DATA_PATH", "data/sample_matches.json"))
+MIN_ODDS = 1.6
 
 if not TOKEN:
-    raise RuntimeError("Заполни TELEGRAM_BOT_TOKEN в Render Environment Variables")
+    raise RuntimeError("Заполни TELEGRAM_BOT_TOKEN в переменных окружения")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 
-class ChatRegistry:
-    def __init__(self, path: Path):
-        self.path = path
-        self.chat_ids: Set[int] = set()
-        self._load()
+def load_sample_matches() -> list[dict[str, Any]]:
+    raw = json.loads(SAMPLE_DATA_PATH.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise ValueError("sample_matches.json должен содержать JSON-массив")
 
-    def _load(self) -> None:
-        if not self.path.exists():
-            return
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                self.chat_ids = {int(chat_id) for chat_id in data}
-        except Exception:
-            self.chat_ids = set()
+    validated: list[dict[str, Any]] = []
+    for idx, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Элемент #{idx} не является объектом")
 
-    def _save(self) -> None:
-        self.path.write_text(
-            json.dumps(sorted(self.chat_ids), ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        required = ["game", "match", "market", "selection", "odds"]
+        missing = [field for field in required if field not in item]
+        if missing:
+            raise ValueError(f"Элемент #{idx}: отсутствуют поля: {', '.join(missing)}")
+
+        odds = float(item["odds"])
+        if odds < MIN_ODDS:
+            continue
+
+        validated.append(
+            {
+                "game": str(item["game"]),
+                "match": str(item["match"]),
+                "market": str(item["market"]),
+                "selection": str(item["selection"]),
+                "odds": odds,
+            }
         )
 
-    def register(self, chat_id: int) -> None:
-        before = len(self.chat_ids)
-        self.chat_ids.add(int(chat_id))
-        if len(self.chat_ids) != before:
-            self._save()
+    return validated
 
 
-registry = ChatRegistry(CHAT_STORAGE_PATH)
+def build_short_analytics(item: dict[str, Any]) -> str:
+    market = item["market"].lower()
+    if "побед" in market:
+        return "Ставка на исход: линия обычно стабильнее и проще для контроля риска."
+    if "тотал" in market:
+        return "Тотал подходит для сценария с темповой/затяжной серией без привязки к победителю."
+    if "фора" in market:
+        return "Фора дает запас при равной игре и снижает зависимость от одного исхода."
+    return "Рынок прошел фильтр по коэффициенту и подходит для аккуратного тестового MVP."
 
 
-def format_prediction(item: dict) -> str:
-    start = f"\n🕒 Старт: {item['start_time']}" if item.get("start_time") else ""
+def risk_level(odds: float) -> str:
+    if odds <= 1.75:
+        return "Низкий"
+    if odds <= 2.00:
+        return "Средний"
+    return "Повышенный"
+
+
+def confidence_level(odds: float) -> str:
+    if odds <= 1.75:
+        return "Высокая"
+    if odds <= 2.00:
+        return "Средняя"
+    return "Умеренная"
+
+
+def format_prediction(item: dict[str, Any]) -> str:
+    odds = item["odds"]
     return (
-        f"🎮 {item['game']}\n"
-        f"⚔️ {item['match']}{start}\n\n"
+        f"🎮 Матч: {item['match']} ({item['game']})\n"
+        f"📍 Куда ставить: {item['selection']}\n"
         f"📌 Рынок: {item['market']}\n"
-        f"✅ Ставка: {item['pick']}\n"
-        f"💰 Коэффициент: {item['odds']:.2f}\n"
-        f"📈 Вероятность: ~{item['probability'] * 100:.1f}%\n"
-        f"🎯 Уверенность: {item['confidence']}\n"
-        f"⚠️ Риск: {item['risk']}\n\n"
-        f"🧠 Почему эта ставка:\n{item['reason']}\n\n"
-        f"⚠️ Не финансовый совет"
+        f"💰 Коэффициент: {odds:.2f}\n"
+        f"🧠 Короткая аналитика: {build_short_analytics(item)}\n"
+        f"⚠️ Риск: {risk_level(odds)}\n"
+        f"🎯 Уверенность: {confidence_level(odds)}"
     )
-
-
-async def send_pari_predictions(chat_id: int) -> None:
-    odds = await get_pari_esports_odds(min_odds=1.6, limit=10)
-
-    if not odds:
-        await bot.send_message(
-            chat_id,
-            "Подходящих вариантов с коэффициентом от 1.6 сейчас нет. "
-            "Проверю снова по расписанию.",
-        )
-        return
-
-    await bot.send_message(
-        chat_id,
-        f"Нашёл {len(odds)} подходящих вариантов. Отправляю лучшие прогнозы:",
-    )
-    for item in odds[:5]:
-        await bot.send_message(chat_id, format_prediction(item))
 
 
 @dp.message(Command("start"))
 async def start(message: types.Message) -> None:
-    registry.register(message.chat.id)
     await message.answer(
-        "Бот работает ✅\n\n"
+        "Бот работает стабильно ✅\n\n"
         "Команды:\n"
-        "/pari — найти прогнозы по Dota 2 / CS2\n"
-        "/id — показать chat id"
+        "/start — список команд\n"
+        "/id — показать chat id\n"
+        "/analyze — анализ mock-данных"
     )
 
 
 @dp.message(Command("id"))
 async def show_id(message: types.Message) -> None:
-    registry.register(message.chat.id)
     await message.answer(f"Ваш chat_id: {message.chat.id}")
 
 
-@dp.message(Command("pari"))
-async def pari(message: types.Message) -> None:
-    registry.register(message.chat.id)
-    await message.answer("Проверяю линию PARI по Dota 2/CS2 и считаю лучшие ставки...")
+@dp.message(Command("analyze"))
+async def analyze(message: types.Message) -> None:
+    await message.answer("Запускаю анализ mock-данных...")
+
     try:
-        await send_pari_predictions(message.chat.id)
+        predictions = load_sample_matches()
     except Exception as exc:
-        await message.answer(f"Ошибка при парсинге PARI: {exc}")
+        await message.answer(f"Ошибка чтения mock-данных: {exc}")
+        return
 
+    if not predictions:
+        await message.answer(f"Нет вариантов с коэффициентом >= {MIN_ODDS}.")
+        return
 
-async def periodic_check_task() -> None:
-    while True:
-        if registry.chat_ids:
-            for chat_id in sorted(registry.chat_ids):
-                try:
-                    await send_pari_predictions(chat_id)
-                except Exception as exc:
-                    await bot.send_message(chat_id, f"Ошибка авто-проверки: {exc}")
-        await asyncio.sleep(max(1, AUTO_CHECK_INTERVAL_MINUTES) * 60)
+    await message.answer(f"Найдено вариантов: {len(predictions)}")
+    for item in predictions:
+        await message.answer(format_prediction(item))
 
 
 async def main() -> None:
-    asyncio.create_task(periodic_check_task())
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
+    import asyncio
+
     asyncio.run(main())
